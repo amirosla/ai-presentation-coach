@@ -8,9 +8,10 @@
     "start": "node src/index.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "ws": "^8.18.0",
+    "@google/genai": "^1.46.0",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "cors": "^2.8.5"
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
   }
 }

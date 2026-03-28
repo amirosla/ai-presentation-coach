@@ -9,6 +9,7 @@ import cors from 'cors'
 import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import { initSmelter, getSmelterConfig } from './smelter.js'
+import { GeminiSession } from './gemini.js'
 
 const app = express()
 const server = createServer(app)
@@ -19,12 +20,22 @@ const FISHJAM_TOKEN = process.env.FISHJAM_SERVER_TOKEN
 app.use(cors())
 app.use(express.json())
 
-// Health check
+// ── Active Gemini session (one per demo) ───────────────────────────────────
+let geminiSession = null
+
+function broadcastCoachMessage(msg) {
+  const json = JSON.stringify(msg)
+  coachWss.clients.forEach(client => {
+    if (client.readyState === 1) client.send(json)
+  })
+}
+
+// ── REST API ───────────────────────────────────────────────────────────────
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
 })
 
-// Create Fishjam room + peer
 app.post('/api/room', async (_req, res) => {
   try {
     const roomRes = await fetch(`${FISHJAM_URL}/room`, {
@@ -63,7 +74,6 @@ app.post('/api/room', async (_req, res) => {
   }
 })
 
-// Return Smelter WHIP config to frontend
 app.get('/api/smelter-config', (_req, res) => {
   const cfg = getSmelterConfig()
   if (!cfg) return res.status(503).json({ error: 'Smelter not ready' })
@@ -72,49 +82,73 @@ app.get('/api/smelter-config', (_req, res) => {
 
 // ── WebSocket servers ──────────────────────────────────────────────────────
 
-const wss = new WebSocketServer({ noServer: true })
-const frameWss = new WebSocketServer({ noServer: true })
+const coachWss = new WebSocketServer({ noServer: true })   // → frontend (feedback)
+const frameWss = new WebSocketServer({ noServer: true })   // ← frontend (video frames)
+const audioWss = new WebSocketServer({ noServer: true })   // ← frontend (audio PCM)
 
-// Route WS connections by path
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws/coach') {
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req))
+    coachWss.handleUpgrade(req, socket, head, ws => coachWss.emit('connection', ws, req))
   } else if (req.url === '/ws/frames') {
     frameWss.handleUpgrade(req, socket, head, ws => frameWss.emit('connection', ws, req))
+  } else if (req.url === '/ws/audio') {
+    audioWss.handleUpgrade(req, socket, head, ws => audioWss.emit('connection', ws, req))
   } else {
     socket.destroy()
   }
 })
 
-// Frontend clients receiving AI feedback
-wss.on('connection', (ws) => {
+// Frontend receives AI coaching feedback
+coachWss.on('connection', (ws) => {
   console.log('[WS/coach] Frontend connected')
   ws.on('close', () => console.log('[WS/coach] Frontend disconnected'))
 })
 
-// Frontend sends canvas frames here
+// Frontend sends 1fps JPEG frames
 frameWss.on('connection', (ws) => {
-  console.log('[WS/frames] Frame stream connected')
+  console.log('[WS/frames] Connected — starting Gemini session')
+
+  // Start a new Gemini session for this presenter
+  geminiSession = new GeminiSession((msg) => broadcastCoachMessage(msg))
+  geminiSession.connect().catch(err => {
+    console.error('[Gemini] Failed to connect:', err.message)
+    geminiSession = null
+  })
 
   ws.on('message', (data) => {
-    // data = base64 JPEG string
     const frameB64 = data.toString()
-    console.log(`[WS/frames] Frame received, size: ${frameB64.length} chars`)
-    // TODO Etap 3: forward to Gemini Live API
+    console.log(`[WS/frames] Frame → Gemini (${Math.round(frameB64.length / 1024)}KB)`)
+    geminiSession?.sendFrame(frameB64)
   })
 
-  ws.on('close', () => console.log('[WS/frames] Frame stream disconnected'))
+  ws.on('close', () => {
+    console.log('[WS/frames] Disconnected — closing Gemini session')
+    geminiSession?.close()
+    geminiSession = null
+  })
 })
 
-// Helper: broadcast AI feedback to all coach clients
-export function broadcastCoachMessage(msg) {
-  const json = JSON.stringify(msg)
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) client.send(json)
+// Frontend sends audio PCM chunks (Int16, 16kHz, mono, binary)
+audioWss.on('connection', (ws) => {
+  console.log('[WS/audio] Connected')
+
+  ws.on('message', (data) => {
+    // data is a Buffer (binary Int16 PCM) — convert to base64 for Gemini
+    const base64Pcm = data.toString('base64')
+    geminiSession?.sendAudio(base64Pcm)
   })
-}
+
+  ws.on('close', () => console.log('[WS/audio] Disconnected'))
+})
 
 // ── Start ──────────────────────────────────────────────────────────────────
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} zajęty — czekam 1s i próbuję ponownie`)
+    setTimeout(() => server.listen(PORT), 1000)
+  }
+})
 
 server.listen(PORT, async () => {
   console.log(`Backend running on http://localhost:${PORT}`)
