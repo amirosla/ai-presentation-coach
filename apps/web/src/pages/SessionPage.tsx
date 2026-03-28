@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { create } from '@fishjam-dev/react-client'
+import { useWhipStream } from '../hooks/useWhipStream'
+import { useFrameExtractor } from '../hooks/useFrameExtractor'
 
 type PeerMetadata = { name: string }
 type TrackMetadata = { type: 'screen' | 'audio' }
@@ -20,12 +22,22 @@ function SessionInner() {
   const fishjamStatus = useStatus()
   const client = useClient()
 
+  const { connect: whipConnect, disconnect: whipDisconnect } = useWhipStream()
+  const { start: startFrames, stop: stopFrames } = useFrameExtractor()
+
   const [peerStatus, setPeerStatus] = useState<PeerStatus>('idle')
   const [error, setError] = useState<string | null>(null)
 
   const screenVideoRef = useRef<HTMLVideoElement>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
   const audioStreamRef = useRef<MediaStream | null>(null)
+
+  // Set srcObject whenever stream or video element becomes available
+  useEffect(() => {
+    if (peerStatus === 'connected' && screenVideoRef.current && screenStreamRef.current) {
+      screenVideoRef.current.srcObject = screenStreamRef.current
+    }
+  }, [peerStatus])
 
   const startSession = async () => {
     setPeerStatus('connecting')
@@ -39,10 +51,6 @@ function SessionInner() {
       })
       screenStreamRef.current = screenStream
 
-      if (screenVideoRef.current) {
-        screenVideoRef.current.srcObject = screenStream
-      }
-
       // 2. Capture microphone
       const audioStream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true },
@@ -51,16 +59,33 @@ function SessionInner() {
       audioStreamRef.current = audioStream
 
       // 3. Get Fishjam peer token from backend
-      const res = await fetch('/api/room', { method: 'POST' })
-      if (!res.ok) throw new Error(`Backend error: ${res.status}`)
-      const { peerToken } = await res.json()
+      const roomRes = await fetch('/api/room', { method: 'POST' })
+      if (!roomRes.ok) throw new Error(`Backend error: ${roomRes.status}`)
+      const { peerToken } = await roomRes.json()
 
-      // 4. Connect to Fishjam (default host: localhost:5002)
+      // 4. Connect to Fishjam
       connect({
         peerMetadata: { name: 'presenter' },
         token: peerToken,
         signaling: { protocol: 'ws', host: 'localhost:5002' },
       })
+
+      // 5. Send screen stream to Smelter via WHIP
+      const smelterRes = await fetch('/api/smelter-config')
+      if (smelterRes.ok) {
+        const smelterCfg = await smelterRes.json()
+        try {
+          // Combine screen + audio for WHIP
+          const combinedStream = new MediaStream([
+            ...screenStream.getVideoTracks(),
+            ...audioStream.getAudioTracks(),
+          ])
+          await whipConnect(combinedStream, smelterCfg)
+        } catch (whipErr) {
+          // Non-fatal: Smelter WHIP failed, canvas frames still work
+          console.warn('[WHIP] Failed, continuing without Smelter push:', whipErr)
+        }
+      }
 
       setPeerStatus('connected')
     } catch (err) {
@@ -72,30 +97,36 @@ function SessionInner() {
     }
   }
 
-  // Publish tracks once Fishjam reports "joined"
+  // Publish tracks to Fishjam once joined
   useEffect(() => {
     if (fishjamStatus !== 'joined' || !client) return
-
     const screenStream = screenStreamRef.current
     const audioStream = audioStreamRef.current
-
-    screenStream?.getVideoTracks().forEach(track => {
-      client.addTrack(track, screenStream, { type: 'screen' })
-    })
-    audioStream?.getAudioTracks().forEach(track => {
-      client.addTrack(track, audioStream, { type: 'audio' })
-    })
+    screenStream?.getVideoTracks().forEach(t => client.addTrack(t, screenStream, { type: 'screen' }))
+    audioStream?.getAudioTracks().forEach(t => client.addTrack(t, audioStream, { type: 'audio' }))
   }, [fishjamStatus, client])
+
+  // Start frame extraction once video is playing
+  useEffect(() => {
+    if (peerStatus !== 'connected') return
+    const video = screenVideoRef.current
+    if (!video) return
+    const onPlaying = () => startFrames(video)
+    video.addEventListener('playing', onPlaying)
+    if (!video.paused && video.readyState >= 3) startFrames(video)
+    return () => video.removeEventListener('playing', onPlaying)
+  }, [peerStatus, startFrames])
 
   const stopSession = () => {
     disconnect()
+    whipDisconnect()
+    stopFrames()
     screenStreamRef.current?.getTracks().forEach(t => t.stop())
     audioStreamRef.current?.getTracks().forEach(t => t.stop())
     if (screenVideoRef.current) screenVideoRef.current.srcObject = null
     setPeerStatus('idle')
   }
 
-  // Stop session if user closes screen share natively
   useEffect(() => {
     const stream = screenStreamRef.current
     if (!stream) return
@@ -120,17 +151,10 @@ function SessionInner() {
           )}
         </div>
 
-        {peerStatus === 'idle' && (
-          <button onClick={startSession} style={btnStyle('#4f46e5')}>Start Session</button>
-        )}
-        {peerStatus === 'connecting' && (
-          <button disabled style={btnStyle('#555')}>Connecting...</button>
-        )}
-        {peerStatus === 'connected' && (
-          <button onClick={stopSession} style={btnStyle('#dc2626')}>Stop Session</button>
-        )}
+        {peerStatus === 'idle' && <button onClick={startSession} style={btnStyle('#4f46e5')}>Start Session</button>}
+        {peerStatus === 'connecting' && <button disabled style={btnStyle('#555')}>Connecting...</button>}
+        {peerStatus === 'connected' && <button onClick={stopSession} style={btnStyle('#dc2626')}>Stop Session</button>}
         {error && <p style={{ color: '#f87171', fontSize: '0.9rem' }}>{error}</p>}
-
         <StatusBadge status={fishjamStatus} />
       </div>
 
