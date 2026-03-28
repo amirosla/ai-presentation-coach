@@ -1,0 +1,26 @@
+services:
+  fishjam:
+    image: ghcr.io/fishjam-cloud/fishjam:latest
+    container_name: fishjam
+    ports:
+      - "5002:5002"   # HTTP API + dashboard
+      - "5003:5003"   # WebRTC signaling (WS)
+      - "50000-50050:50000-50050/udp"  # WebRTC media (UDP)
+    environment:
+      - FISHJAM_HOST=localhost
+      - FISHJAM_PORT=5002
+      - FISHJAM_MEDIA_PORT_RANGE=50000-50050
+      - FISHJAM_SERVER_API_TOKEN=${FISHJAM_SERVER_TOKEN}
+      - FJ_JLL_ENABLE_TELEMETRY=false
+    restart: unless-stopped
+
+  smelter:
+    image: ghcr.io/software-mansion/smelter:latest
+    container_name: smelter
+    ports:
+      - "8081:8081"   # Smelter HTTP API
+    environment:
+      - SMELTER_API_PORT=8081
+      - SMELTER_FRAMERATE=30
+      - SMELTER_OUTPUT_SAMPLE_RATE=16000
+    restart: unless-stopped
